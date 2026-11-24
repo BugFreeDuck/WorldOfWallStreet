@@ -1,0 +1,7 @@
+## Interface: 120105
+## Title: World of Wall Street
+## Notes: Track materials bought for investment and how their value changes.
+## Author: BugFreeDuck
+## Version: 0.0.1
+
+WorldOfWallStreet.lua
