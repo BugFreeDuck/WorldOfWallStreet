@@ -1,7 +1,8 @@
-## Interface: 120105
+## Interface: 120105, 16001
 ## Title: World of Wall Street
 ## Notes: Track materials bought for investment and how their value changes.
 ## Author: BugFreeDuck
-## Version: 0.0.1
+## Version: 0.3.0
+## SavedVariables: WorldOfWallStreetDB
 
 WorldOfWallStreet.lua
