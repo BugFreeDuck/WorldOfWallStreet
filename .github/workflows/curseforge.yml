@@ -1,0 +1,67 @@
+name: Publish to CurseForge
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  publish:
+    name: Upload release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read tag version
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          case "$version" in
+            *alpha*|*Alpha*|*ALPHA*)
+              echo "release_type=alpha" >> "$GITHUB_OUTPUT"
+              ;;
+            *beta*|*Beta*|*BETA*|*rc*|*RC*)
+              echo "release_type=beta" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "release_type=release" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Package addon
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          version = os.environ["VERSION"]
+          path = Path("WorldOfWallStreet.toc")
+          lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+          updated = []
+          for line in lines:
+              if line.startswith("## Version:"):
+                  newline = "\n" if line.endswith("\n") else ""
+                  updated.append(f"## Version: {version}{newline}")
+              else:
+                  updated.append(line)
+          path.write_text("".join(updated), encoding="utf-8")
+          PY
+          mkdir -p dist/WorldOfWallStreet
+          cp WorldOfWallStreet.toc WorldOfWallStreet.lua DataAccess.lua Logic.lua UI.lua DonutSegment.tga dist/WorldOfWallStreet/
+          (cd dist && zip -r "../WorldOfWallStreet-${VERSION}.zip" WorldOfWallStreet)
+
+      - name: Upload to CurseForge
+        uses: itsmeow/curseforge-upload@v3
+        with:
+          token: ${{ secrets.CF_API_TOKEN }}
+          project_id: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          game_endpoint: wow
+          file_path: WorldOfWallStreet-${{ steps.version.outputs.version }}.zip
+          display_name: WorldOfWallStreet-${{ steps.version.outputs.version }}
+          release_type: ${{ steps.version.outputs.release_type }}
+          game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS }}
+          changelog_type: markdown
