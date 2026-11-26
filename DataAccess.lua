@@ -29,6 +29,28 @@ local function PlainNumber(value)
     end
 end
 
+local function PositiveQuantity(value)
+    value = PlainNumber(value)
+    if type(value) == "number" and value >= 1 then
+        return math.floor(value)
+    end
+end
+
+local function ResolveQuantity(quantity, totalCost, unitPrice)
+    quantity = PositiveQuantity(quantity)
+    if quantity then
+        return quantity
+    end
+    totalCost = PlainNumber(totalCost)
+    unitPrice = PlainNumber(unitPrice)
+    if totalCost and unitPrice and unitPrice > 0 and totalCost > 0 then
+        local inferred = math.floor((totalCost / unitPrice) + 0.5)
+        if inferred >= 1 then
+            return inferred
+        end
+    end
+end
+
 local function DB()
     local db = WorldOfWallStreetDB
     if type(db) ~= "table" then
@@ -98,7 +120,7 @@ local function AddPurchase(fields)
 
     local db = DB()
     local totalCost = fields.totalCost
-    local quantity = fields.quantity or 1
+    local quantity = PositiveQuantity(fields.quantity) or 1
     local unitCost = nil
     if type(totalCost) == "number" and quantity > 0 then
         unitCost = math.floor(totalCost / quantity)
@@ -152,15 +174,15 @@ local function CommodityBuyContext()
             if input and not quantity then
                 if input.GetQuantity then
                     local ok, value = pcall(input.GetQuantity, input)
-                    quantity = ok and PlainNumber(value) or nil
+                    quantity = ok and PositiveQuantity(value) or nil
                 end
                 if not quantity and input.GetNumber then
                     local ok, value = pcall(input.GetNumber, input)
-                    quantity = ok and PlainNumber(value) or nil
+                    quantity = ok and PositiveQuantity(value) or nil
                 end
                 if not quantity and input.GetText then
                     local ok, text = pcall(input.GetText, input)
-                    quantity = ok and tonumber(text) or nil
+                    quantity = ok and PositiveQuantity(tonumber(text)) or nil
                 end
             end
         end
@@ -182,20 +204,23 @@ local function QuoteCost(quote)
     return PlainNumber(quote.totalPrice)
 end
 
-local function CommitCommodityPurchase(itemID, quantity, totalCost, unverified)
+local function CommitCommodityPurchase(itemID, quantity, totalCost, unverified, unitPrice)
     itemID = PlainNumber(itemID)
-    quantity = PlainNumber(quantity)
     totalCost = PlainNumber(totalCost)
+    quantity = ResolveQuantity(quantity, totalCost, unitPrice)
     if not itemID or WasJustRecorded(itemID) then
+        return false
+    end
+    if not quantity then
         return false
     end
 
     AddPurchase({
         itemID = itemID,
-        quantity = quantity or 1,
+        quantity = quantity,
         totalCost = totalCost,
         kind = "commodity",
-        unverified = unverified or totalCost == nil or quantity == nil,
+        unverified = unverified or totalCost == nil,
     })
     return true
 end
@@ -220,7 +245,7 @@ local function CacheItemSearchResults(itemKey)
             auctionCache[info.auctionID] = {
                 itemID = itemID,
                 itemLink = info.itemLink,
-                quantity = info.quantity or 1,
+                quantity = PositiveQuantity(info.quantity) or 1,
                 buyout = info.buyoutAmount,
             }
         end
@@ -409,11 +434,15 @@ end
 local function OnCommodityPriceUpdated(unitPrice, totalPrice)
     local itemID, quantity = CommodityBuyContext()
     itemID = PlainNumber(itemID) or lastCommodityItemID
+    quantity = PositiveQuantity(quantity)
+    if not quantity and pendingQuote and pendingQuote.itemID == itemID then
+        quantity = pendingQuote.quantity
+    end
     pendingQuote = {
         unitPrice = PlainNumber(unitPrice),
         totalPrice = PlainNumber(totalPrice),
         itemID = itemID,
-        quantity = PlainNumber(quantity),
+        quantity = quantity,
         money = PlainNumber(GetMoney()),
     }
 end
@@ -430,8 +459,34 @@ local function OnCommodityPurchaseSucceeded()
 
     local itemID = quote.itemID or lastCommodityItemID
     local totalCost = QuoteCost(quote)
-    if CommitCommodityPurchase(itemID, quote.quantity, totalCost, quote.quantity == nil) then
+    local quantity = ResolveQuantity(quote.quantity, totalCost, quote.unitPrice)
+    if not quantity then
+        return
+    end
+    if CommitCommodityPurchase(itemID, quantity, totalCost, false, quote.unitPrice) then
         pendingQuote = nil
+    end
+end
+
+local function CorrectRecentQuantity(itemID, quantity)
+    quantity = PositiveQuantity(quantity)
+    if not itemID or not quantity then
+        return
+    end
+    local now = GetServerTime()
+    local purchases = DB().purchases
+    for index = #purchases, 1, -1 do
+        local purchase = purchases[index]
+        if purchase.itemID == itemID and (now - (purchase.boughtAt or 0)) <= 3 and (purchase.quantity or 0) < 1 then
+            purchase.quantity = quantity
+            if type(purchase.totalCost) == "number" and quantity > 0 then
+                purchase.unitCost = math.floor(purchase.totalCost / quantity)
+            end
+            if NS.UI and NS.UI.Refresh then
+                NS.UI.Refresh()
+            end
+            return
+        end
     end
 end
 
@@ -441,7 +496,11 @@ local function OnCommodityPurchased(itemID, quantity)
     local quote = pendingQuote
     pendingQuote = nil
 
-    if not itemID or WasJustRecorded(itemID) then
+    if not itemID then
+        return
+    end
+    if WasJustRecorded(itemID) then
+        CorrectRecentQuantity(itemID, quantity)
         return
     end
 
@@ -451,11 +510,12 @@ local function OnCommodityPurchased(itemID, quantity)
         totalCost = nil
         unverified = true
     end
+    quantity = ResolveQuantity(quantity, totalCost, quote and quote.unitPrice)
     if quote and quote.quantity and quantity and quote.quantity ~= quantity then
         unverified = true
     end
 
-    CommitCommodityPurchase(itemID, quantity, totalCost, unverified)
+    CommitCommodityPurchase(itemID, quantity, totalCost, unverified, quote and quote.unitPrice)
 end
 
 local function OnItemSearchResultsUpdated(itemKey)
@@ -472,7 +532,7 @@ local function OnAuctionHousePurchaseCompleted(auctionID)
     AddPurchase({
         itemID = info.itemID,
         itemLink = info.itemLink,
-        quantity = info.quantity or 1,
+        quantity = PositiveQuantity(info.quantity) or 1,
         totalCost = info.buyout,
         kind = "item",
         unverified = type(info.buyout) ~= "number",

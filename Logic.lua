@@ -236,6 +236,7 @@ local function PositionMarketUnit(position)
 end
 
 local sparkCache = {}
+local auctionatorSampleCache = {}
 local lastAuctionatorUpdate = 0
 local auctionatorQuietWait = false
 local AUCTIONATOR_QUIET_SECONDS = 1.5
@@ -251,6 +252,7 @@ local function OnAuctionatorQuiet()
     end
     auctionatorQuietWait = false
     sparkCache = {}
+    auctionatorSampleCache = {}
     if NS.UI and NS.UI.RefreshPortfolio then
         NS.UI.RefreshPortfolio()
     end
@@ -513,7 +515,15 @@ local function RegistrableQuantity(item)
 end
 
 local SPARK_DAYS = 30
+local HISTORY_DAYS = 366
 local DAY_SECONDS = 86400
+local VALUE_RANGES = {
+    ["1w"] = 7,
+    ["1m"] = 30,
+    ["3m"] = 90,
+    ["6m"] = 180,
+    ["1y"] = 365,
+}
 
 local function AuctionatorDBKeys(itemID, itemLink)
     local keys = {}
@@ -536,7 +546,8 @@ local function AuctionatorDBKeys(itemID, itemLink)
     return keys
 end
 
-local function PricesFromHistory(history)
+local function PricesFromHistory(history, limit)
+    limit = limit or SPARK_DAYS
     local prices = {}
     if type(history) ~= "table" then
         return prices
@@ -549,7 +560,7 @@ local function PricesFromHistory(history)
         table.sort(days, function(a, b)
             return a.day < b.day
         end)
-        local startAt = math.max(1, #days - (SPARK_DAYS - 1))
+        local startAt = math.max(1, #days - (limit - 1))
         for index = startAt, #days do
             local price = CopperPrice(days[index].price)
             if price then
@@ -561,7 +572,7 @@ local function PricesFromHistory(history)
     if #history < 1 then
         return prices
     end
-    local startAt = math.max(1, #history - (SPARK_DAYS - 1))
+    local startAt = math.max(1, #history - (limit - 1))
     for index = startAt, #history do
         local entry = history[index]
         local raw = entry
@@ -604,7 +615,7 @@ local function SavedSparkline(itemID, price)
         db.marketHistory[key] = series
     end
     local day = math.floor((GetServerTime() or 0) / DAY_SECONDS)
-    local cutoff = day - (SPARK_DAYS - 1)
+    local cutoff = day - (HISTORY_DAYS - 1)
     local writeIndex = 1
     for readIndex = 1, #series do
         local sample = series[readIndex]
@@ -638,6 +649,46 @@ local function SavedSparkline(itemID, price)
     return prices
 end
 
+local function LastPrices(prices, limit)
+    if #prices <= limit then
+        return prices
+    end
+    local tail = {}
+    local startAt = #prices - limit + 1
+    for index = startAt, #prices do
+        tail[#tail + 1] = prices[index]
+    end
+    return tail
+end
+
+local function AuctionatorSamples(itemID, itemLink)
+    local today = math.floor((GetServerTime() or 0) / DAY_SECONDS)
+    local cached = auctionatorSampleCache[itemID]
+    if cached and cached.day == today then
+        return cached.samples
+    end
+    if not AuctionatorSettled() or not Auctionator or not Auctionator.Database or not Auctionator.Database.GetPriceHistory then
+        return {}
+    end
+    local best = {}
+    for _, key in ipairs(AuctionatorDBKeys(itemID, itemLink)) do
+        local ok, history = pcall(Auctionator.Database.GetPriceHistory, Auctionator.Database, key)
+        if ok then
+            local prices = PricesFromHistory(history, HISTORY_DAYS)
+            if #prices > #best then
+                best = prices
+            end
+        end
+    end
+    local samples = {}
+    local startDay = today - #best + 1
+    for index, price in ipairs(best) do
+        samples[index] = { day = startDay + index - 1, price = price }
+    end
+    auctionatorSampleCache[itemID] = { day = today, samples = samples }
+    return samples
+end
+
 local function MarketSparkline(itemID, itemLink)
     if not itemID then
         return {}
@@ -655,7 +706,7 @@ local function MarketSparkline(itemID, itemLink)
 
     local settled = AuctionatorSettled()
     local price = settled and MarketUnitPrice(itemID, itemLink) or nil
-    local saved = SavedSparkline(itemID, price)
+    local saved = LastPrices(SavedSparkline(itemID, price), SPARK_DAYS)
     local prices = saved
     if settled and source == MARKET_SOURCE_AUCTIONATOR then
         local history = AuctionatorHistory(itemID, itemLink)
@@ -667,6 +718,117 @@ local function MarketSparkline(itemID, itemLink)
         sparkCache[cacheKey] = prices
     end
     return prices
+end
+
+local function PortfolioValueHistory(rangeKey)
+    local dayCount = VALUE_RANGES[rangeKey] or VALUE_RANGES["1m"]
+    local today = math.floor((GetServerTime() or 0) / DAY_SECONDS)
+    local startDay = today - dayCount + 1
+    local history = DB().marketHistory
+    local useAuctionator = AuctionatorSettled() and EffectiveMarketSource() == MARKET_SOURCE_AUCTIONATOR
+    local tracks = {}
+    local seen = {}
+
+    for _, purchase in ipairs(DB().purchases) do
+        if purchase.investment and purchase.itemID then
+            local track = seen[purchase.itemID]
+            if not track then
+                track = {
+                    itemID = purchase.itemID,
+                    itemLink = purchase.itemLink,
+                    lots = {},
+                    prices = {},
+                    quantity = 0,
+                    price = nil,
+                    stepIndex = 1,
+                    priceIndex = 1,
+                }
+                seen[purchase.itemID] = track
+                tracks[#tracks + 1] = track
+            end
+            if purchase.itemLink then
+                track.itemLink = purchase.itemLink
+            end
+            local boughtAt = purchase.boughtAt or 0
+            local lotDay = boughtAt > 0 and math.floor(boughtAt / DAY_SECONDS) or today
+            track.lots[#track.lots + 1] = { day = lotDay, quantity = purchase.quantity or 1 }
+        end
+    end
+
+    for _, track in ipairs(tracks) do
+        local priceByDay = {}
+        local series = type(history) == "table" and history[tostring(track.itemID)] or nil
+        if type(series) == "table" then
+            for _, sample in ipairs(series) do
+                if type(sample) == "table" and type(sample.day) == "number" and type(sample.price) == "number" and sample.price > 0 then
+                    priceByDay[sample.day] = sample.price
+                end
+            end
+        end
+        if useAuctionator then
+            for _, sample in ipairs(AuctionatorSamples(track.itemID, track.itemLink)) do
+                if not priceByDay[sample.day] then
+                    priceByDay[sample.day] = sample.price
+                end
+            end
+        end
+        local days = {}
+        for day, price in pairs(priceByDay) do
+            days[#days + 1] = day
+        end
+        table.sort(days)
+        for _, day in ipairs(days) do
+            track.prices[#track.prices + 1] = { day = day, price = priceByDay[day] }
+        end
+        table.sort(track.lots, function(a, b)
+            return a.day < b.day
+        end)
+        local steps = {}
+        local quantity = 0
+        for _, lot in ipairs(track.lots) do
+            quantity = quantity + lot.quantity
+            local step = steps[#steps]
+            if step and step.day == lot.day then
+                step.quantity = quantity
+            else
+                steps[#steps + 1] = { day = lot.day, quantity = quantity }
+            end
+        end
+        track.steps = steps
+    end
+
+    local function ValueOnDay(track, day)
+        local steps = track.steps
+        while track.stepIndex <= #steps and steps[track.stepIndex].day <= day do
+            track.quantity = steps[track.stepIndex].quantity
+            track.stepIndex = track.stepIndex + 1
+        end
+        while track.priceIndex <= #track.prices and track.prices[track.priceIndex].day <= day do
+            track.price = track.prices[track.priceIndex].price
+            track.priceIndex = track.priceIndex + 1
+        end
+        if track.quantity > 0 and track.price then
+            return track.quantity * track.price
+        end
+        return nil
+    end
+
+    local points = {}
+    for day = startDay, today do
+        local total = 0
+        local priced = false
+        for _, track in ipairs(tracks) do
+            local value = ValueOnDay(track, day)
+            if value then
+                total = total + value
+                priced = true
+            end
+        end
+        if priced then
+            points[#points + 1] = { day = day, value = total }
+        end
+    end
+    return points
 end
 
 local function ClearItemRequest(itemID, success)
@@ -681,6 +843,7 @@ NS.Logic.FormatSignedMoney = FormatSignedMoney
 NS.Logic.FormatSignedPercent = FormatSignedPercent
 NS.Logic.BuildPositions = BuildPositions
 NS.Logic.PortfolioOverview = PortfolioOverview
+NS.Logic.PortfolioValueHistory = PortfolioValueHistory
 NS.Logic.MarketUnitPrice = MarketUnitPrice
 NS.Logic.PositionMarketUnit = PositionMarketUnit
 NS.Logic.MarketSparkline = MarketSparkline

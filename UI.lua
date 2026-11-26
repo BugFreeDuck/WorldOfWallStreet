@@ -14,6 +14,7 @@ local FormatSignedMoney = NS.Logic.FormatSignedMoney
 local FormatSignedPercent = NS.Logic.FormatSignedPercent
 local BuildPositions = NS.Logic.BuildPositions
 local PortfolioOverview = NS.Logic.PortfolioOverview
+local PortfolioValueHistory = NS.Logic.PortfolioValueHistory
 local PositionMarketUnit = NS.Logic.PositionMarketUnit
 local MarketUnitPrice = NS.Logic.MarketUnitPrice
 local OwnedQuantity = NS.Logic.OwnedQuantity
@@ -36,7 +37,16 @@ local ROW_GAP = 4
 local ROW_STRIDE = ROW_HEIGHT + ROW_GAP
 local POSITION_HEIGHT = 36
 local LOT_HEIGHT = 24
-local OVERVIEW_HEIGHT = 176
+local SUMMARY_HEIGHT = 176
+local VALUE_CHART_BAND = 144
+local OVERVIEW_HEIGHT = SUMMARY_HEIGHT + VALUE_CHART_BAND
+local VALUE_RANGES = {
+    { key = "1w", label = "1W" },
+    { key = "1m", label = "1M" },
+    { key = "3m", label = "3M" },
+    { key = "6m", label = "6M" },
+    { key = "1y", label = "1Y" },
+}
 local DONUT_SEGMENTS = 160
 local DONUT_RADIUS = 44
 local DONUT_THICKNESS = 20
@@ -80,6 +90,8 @@ local overviewValueNote
 local overviewGain
 local overviewGainPercent
 local overviewDonut
+local overviewChart
+local valueRangeButtons = {}
 local positionPool = {}
 local lotPool = {}
 local expandedPositions = {}
@@ -688,6 +700,191 @@ local function ApplyLotRow(row, lot)
     row.percent:SetTextColor(percentRed, percentGreen, percentBlue)
 end
 
+local function SelectedValueRange()
+    local saved = DB().portfolioValueRange
+    for _, range in ipairs(VALUE_RANGES) do
+        if range.key == saved then
+            return saved
+        end
+    end
+    return "1m"
+end
+
+local function StyleValueRangeButton(button, selected)
+    if selected then
+        button:SetBackdropColor(0.18, 0.15, 0.08, 1)
+        button:SetBackdropBorderColor(0.86, 0.72, 0.28, 1)
+        button.label:SetTextColor(1, 0.86, 0.45)
+    else
+        button:SetBackdropColor(0.07, 0.07, 0.07, 1)
+        button:SetBackdropBorderColor(0.28, 0.28, 0.28, 1)
+        button.label:SetTextColor(0.75, 0.75, 0.75)
+    end
+end
+
+local function HideValueAxisLabels()
+    if not overviewChart or not overviewChart.axisLabels then
+        return
+    end
+    for _, label in ipairs(overviewChart.axisLabels) do
+        label:Hide()
+    end
+end
+
+local function DrawValueChart(points)
+    if not overviewChart then
+        return
+    end
+    overviewChart.points = points
+    local lines = overviewChart.lines
+    local count = points and #points or 0
+    if count < 2 then
+        for index = 1, #lines do
+            lines[index]:Hide()
+        end
+        overviewChart.plot = nil
+        HideValueAxisLabels()
+        overviewChart.empty:Show()
+        return
+    end
+    local width = overviewChart:GetWidth()
+    local height = overviewChart:GetHeight()
+    if not width or width < 20 or not height or height < 20 then
+        return
+    end
+    overviewChart.empty:Hide()
+    local minValue = points[1].value
+    local maxValue = points[1].value
+    for index = 2, count do
+        if points[index].value < minValue then
+            minValue = points[index].value
+        end
+        if points[index].value > maxValue then
+            maxValue = points[index].value
+        end
+    end
+    local span = maxValue - minValue
+    local function GoldText(value)
+        local gold = math.floor(value / 10000)
+        local text = BreakUpLargeNumbers and BreakUpLargeNumbers(gold) or tostring(gold)
+        return text .. "|TInterface\\MoneyFrame\\UI-GoldIcon:0:0:2:0|t"
+    end
+    local yLabels = {
+        { label = overviewChart.yMax, value = maxValue },
+        { label = overviewChart.yMin, value = minValue },
+    }
+    if span > 0 then
+        yLabels[#yLabels + 1] = { label = overviewChart.yMid, value = (minValue + maxValue) / 2 }
+    else
+        overviewChart.yMid:Hide()
+        overviewChart.yMin:Hide()
+        yLabels = { { label = overviewChart.yMax, value = maxValue } }
+    end
+    local labelWidth = 0
+    for _, entry in ipairs(yLabels) do
+        entry.label:SetText(GoldText(entry.value))
+        local measured = entry.label:GetStringWidth() or 0
+        if measured > labelWidth then
+            labelWidth = measured
+        end
+    end
+    labelWidth = labelWidth + 16
+    local plotRight = 16
+    local plotLeft = plotRight + labelWidth + plotRight
+    local plotBottom = 20
+    local plotTop = 14
+    local plotWidth = width - plotLeft - plotRight
+    local plotHeight = height - plotBottom - plotTop
+    if plotWidth < 20 or plotHeight < 12 then
+        return
+    end
+    overviewChart.plot = {
+        left = plotLeft,
+        bottom = plotBottom,
+        width = plotWidth,
+        height = plotHeight,
+    }
+    local function pointY(value)
+        if span <= 0 then
+            return plotBottom + plotHeight / 2
+        end
+        return plotBottom + ((value - minValue) / span) * plotHeight
+    end
+    local rising = points[count].value >= points[1].value
+    local red, green, blue = 0.95, 0.38, 0.32
+    if rising then
+        red, green, blue = 0.30, 0.86, 0.40
+    end
+    local segments = count - 1
+    for index = 1, math.max(segments, #lines) do
+        local line = lines[index]
+        if not line then
+            line = overviewChart:CreateTexture(nil, "ARTWORK")
+            line:SetTexture("Interface\\Buttons\\WHITE8X8")
+            if line.SetSnapToPixelGrid then
+                line:SetSnapToPixelGrid(false)
+            end
+            if line.SetTexelSnappingBias then
+                line:SetTexelSnappingBias(0)
+            end
+            lines[index] = line
+        end
+        if index > segments then
+            line:Hide()
+        else
+            local x1 = plotLeft + (index - 1) / segments * plotWidth
+            local x2 = plotLeft + index / segments * plotWidth
+            local y1 = pointY(points[index].value)
+            local y2 = pointY(points[index + 1].value)
+            local dx = x2 - x1
+            local dy = y2 - y1
+            local length = math.sqrt(dx * dx + dy * dy)
+            if length < 1 then
+                length = 1
+            end
+            line:ClearAllPoints()
+            line:SetSize(length, 2)
+            line:SetPoint("CENTER", overviewChart, "BOTTOMLEFT", (x1 + x2) / 2, (y1 + y2) / 2)
+            if line.SetRotation then
+                line:SetRotation(math.atan2(dy, dx))
+            end
+            line:SetVertexColor(red, green, blue, 1)
+            line:Show()
+        end
+    end
+
+    local function PlaceValueLabel(label, y)
+        label:ClearAllPoints()
+        label:SetWidth(labelWidth)
+        label:SetPoint("RIGHT", overviewChart, "BOTTOMLEFT", plotLeft - plotRight, y)
+        label:Show()
+    end
+    for _, entry in ipairs(yLabels) do
+        PlaceValueLabel(entry.label, pointY(entry.value))
+    end
+
+    local withYear = (points[count].day - points[1].day) > 120
+    local function AxisDate(day)
+        if withYear then
+            return date("%b %Y", day * 86400)
+        end
+        return date("%b %d", day * 86400)
+    end
+    local function PlaceTimeLabel(label, point, anchor, relative, x)
+        label:ClearAllPoints()
+        label:SetPoint(anchor, overviewChart, relative, x, 3)
+        label:SetText(AxisDate(point.day))
+        label:Show()
+    end
+    PlaceTimeLabel(overviewChart.xStart, points[1], "BOTTOMLEFT", "BOTTOMLEFT", plotLeft)
+    PlaceTimeLabel(overviewChart.xEnd, points[count], "BOTTOMRIGHT", "BOTTOMLEFT", plotLeft + plotWidth)
+    if count >= 3 then
+        PlaceTimeLabel(overviewChart.xMid, points[math.floor((count + 1) / 2)], "BOTTOM", "BOTTOMLEFT", plotLeft + plotWidth / 2)
+    else
+        overviewChart.xMid:Hide()
+    end
+end
+
 local function PaintOverviewDonut(slices)
     local segments = overviewDonut.segments
     local bounds = {}
@@ -767,6 +964,12 @@ local function UpdatePortfolioOverview(positions)
             entry:Hide()
         end
     end
+
+    local range = SelectedValueRange()
+    for _, button in ipairs(valueRangeButtons) do
+        StyleValueRangeButton(button, button.rangeKey == range)
+    end
+    DrawValueChart(PortfolioValueHistory(range))
 end
 
 local function RefreshPortfolio()
@@ -1439,7 +1642,7 @@ local function CreatePortfolioPanel()
     overviewDonut = CreateFrame("Frame", nil, portfolioOverview)
     local donutSize = (DONUT_RADIUS + DONUT_THICKNESS / 2) * 2 + 8
     overviewDonut:SetSize(donutSize, donutSize)
-    overviewDonut:SetPoint("LEFT", portfolioOverview, "LEFT", 248, 0)
+    overviewDonut:SetPoint("TOPLEFT", portfolioOverview, "TOPLEFT", 248, -math.floor((SUMMARY_HEIGHT - donutSize) / 2))
     overviewDonut:EnableMouse(true)
     overviewDonut.segments = {}
     local arc = (2 * math.pi * DONUT_RADIUS / DONUT_SEGMENTS) + 2
@@ -1462,7 +1665,7 @@ local function CreatePortfolioPanel()
         overviewDonut.segments[index] = segment
     end
     overviewDonut.legend = {}
-    local legendTop = math.floor((OVERVIEW_HEIGHT - LEGEND_ROWS * LEGEND_ROW) / 2)
+    local legendTop = math.floor((SUMMARY_HEIGHT - LEGEND_ROWS * LEGEND_ROW) / 2)
     local legendLeft = 248 + donutSize + 18
     for index = 1, 11 do
         local column = index > LEGEND_ROWS and 1 or 0
@@ -1567,6 +1770,121 @@ local function CreatePortfolioPanel()
         self:SetScript("OnUpdate", nil)
         GameTooltip:Hide()
     end)
+
+    local chartLabel = portfolioOverview:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    chartLabel:SetText("Portfolio value")
+    overviewChart = CreateFrame("Frame", nil, portfolioOverview, "BackdropTemplate")
+    overviewChart:SetPoint("BOTTOMLEFT", 12, 10)
+    overviewChart:SetPoint("BOTTOMRIGHT", -12, 10)
+    overviewChart:SetHeight(104)
+    overviewChart:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8",
+        edgeSize = 1,
+    })
+    overviewChart:SetBackdropColor(0.03, 0.03, 0.03, 0.9)
+    overviewChart:SetBackdropBorderColor(0.18, 0.18, 0.18, 1)
+    overviewChart:EnableMouse(true)
+    overviewChart.lines = {}
+    overviewChart.points = {}
+    local function MakeAxisLabel(justifyH)
+        local label = overviewChart:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        label:SetJustifyH(justifyH)
+        label:SetWordWrap(false)
+        label:SetTextColor(0.62, 0.62, 0.62)
+        label:Hide()
+        return label
+    end
+    overviewChart.yMax = MakeAxisLabel("RIGHT")
+    overviewChart.yMid = MakeAxisLabel("RIGHT")
+    overviewChart.yMin = MakeAxisLabel("RIGHT")
+    overviewChart.xStart = MakeAxisLabel("LEFT")
+    overviewChart.xMid = MakeAxisLabel("CENTER")
+    overviewChart.xEnd = MakeAxisLabel("RIGHT")
+    overviewChart.axisLabels = {
+        overviewChart.yMax,
+        overviewChart.yMid,
+        overviewChart.yMin,
+        overviewChart.xStart,
+        overviewChart.xMid,
+        overviewChart.xEnd,
+    }
+    local chartEmpty = overviewChart:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    chartEmpty:SetPoint("CENTER")
+    chartEmpty:SetText("Price history builds once a day.")
+    overviewChart.empty = chartEmpty
+    chartLabel:SetPoint("BOTTOMLEFT", overviewChart, "TOPLEFT", 0, 8)
+    local function ShowValueTooltip()
+        local points = overviewChart.points
+        if not points or #points == 0 then
+            return
+        end
+        local left = overviewChart:GetLeft()
+        local width = overviewChart:GetWidth()
+        if not left or not width or width < 20 then
+            return
+        end
+        local plot = overviewChart.plot
+        if not plot then
+            return
+        end
+        local scale = overviewChart:GetEffectiveScale() or 1
+        local cursorX = GetCursorPosition() / scale - left
+        local turn = plot.width > 0 and (cursorX - plot.left) / plot.width or 0
+        if turn < 0 then
+            turn = 0
+        elseif turn > 1 then
+            turn = 1
+        end
+        local index = 1
+        if #points > 1 then
+            index = math.floor(turn * (#points - 1) + 0.5) + 1
+        end
+        if index < 1 then
+            index = 1
+        elseif index > #points then
+            index = #points
+        end
+        local point = points[index]
+        GameTooltip:SetOwner(overviewChart, "ANCHOR_CURSOR")
+        GameTooltip:SetText(date("%b %d, %Y", point.day * 86400))
+        GameTooltip:AddLine(FormatMoney(point.value), 1, 1, 1)
+        GameTooltip:Show()
+    end
+    overviewChart:SetScript("OnEnter", function(self)
+        self:SetScript("OnUpdate", ShowValueTooltip)
+        ShowValueTooltip()
+    end)
+    overviewChart:SetScript("OnLeave", function(self)
+        self:SetScript("OnUpdate", nil)
+        GameTooltip:Hide()
+    end)
+    overviewChart:SetScript("OnSizeChanged", function()
+        if overviewChart.points and #overviewChart.points >= 2 then
+            DrawValueChart(overviewChart.points)
+        end
+    end)
+    for index, range in ipairs(VALUE_RANGES) do
+        local button = CreateFrame("Button", nil, portfolioOverview, "BackdropTemplate")
+        button:SetSize(36, 18)
+        button:SetPoint("BOTTOMRIGHT", overviewChart, "TOPRIGHT", -((#VALUE_RANGES - index) * 40), 6)
+        button:SetBackdrop({
+            bgFile = "Interface\\Buttons\\WHITE8X8",
+            edgeFile = "Interface\\Buttons\\WHITE8X8",
+            edgeSize = 1,
+        })
+        local buttonLabel = button:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        buttonLabel:SetPoint("CENTER")
+        buttonLabel:SetText(range.label)
+        button.label = buttonLabel
+        button.rangeKey = range.key
+        button:SetScript("OnClick", function()
+            DB().portfolioValueRange = range.key
+            RefreshPortfolio()
+        end)
+        StyleValueRangeButton(button, range.key == "1m")
+        valueRangeButtons[index] = button
+    end
 
     portfolioTitle = portfolioPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     portfolioTitle:SetPoint("TOPLEFT", 4, -(OVERVIEW_HEIGHT + 10))
@@ -1904,7 +2222,7 @@ end
 
 local function CreateWindow()
     local frame = CreateFrame("Frame", "WorldOfWallStreetFrame", UIParent, "BasicFrameTemplateWithInset")
-    frame:SetSize(1100, 520)
+    frame:SetSize(1100, 680)
     frame:SetPoint("CENTER")
     frame:SetFrameStrata("HIGH")
     frame:SetMovable(true)
@@ -1987,9 +2305,9 @@ local function CreateWindow()
 
     frame:SetResizable(true)
     if frame.SetResizeBounds then
-        frame:SetResizeBounds(980, 320, 1600, 1000)
+        frame:SetResizeBounds(980, 480, 1600, 1000)
     else
-        frame:SetMinResize(980, 320)
+        frame:SetMinResize(980, 480)
         frame:SetMaxResize(1600, 1000)
     end
 
@@ -2049,7 +2367,7 @@ NS.UI.OnAddonLoaded = function(name, addonName)
         PlaceMinimapButton(db.minimapAngle)
         if mainFrame and type(db.windowWidth) == "number" and type(db.windowHeight) == "number" then
             local width = math.max(980, math.min(1600, db.windowWidth))
-            local height = math.max(320, math.min(1000, db.windowHeight))
+            local height = math.max(480, math.min(1000, db.windowHeight))
             mainFrame:SetSize(width, height)
         end
     end
